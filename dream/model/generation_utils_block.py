@@ -25,6 +25,7 @@ import torch.distributions as dists
 from torch.nn import functional as F
 from transformers import __version__
 from .idd import IDDController
+from .ultrafast import UltraFastContext, DeltaKVLowRank, FreezeWindowController
 from transformers.generation.configuration_utils import (
     GenerationConfig
 )
@@ -144,6 +145,17 @@ class DreamGenerationConfig(GenerationConfig):
         self.idd_mmi_threshold: float = kwargs.pop("idd_mmi_threshold", 0.1)
         self.idd_slope_epsilon: float = kwargs.pop("idd_slope_epsilon", 1e-4)
         self.idd_max_conflict_tokens: int = kwargs.pop("idd_max_conflict_tokens", 4)
+
+        # UltraFast-dLLM knobs
+        self.ultrafast_enable: bool = kwargs.pop("ultrafast_enable", True)
+        self.ultrafast_top_k: int = kwargs.pop("ultrafast_top_k", 64)
+        self.ultrafast_epsilon: float = kwargs.pop("ultrafast_epsilon", 1e-3)
+        self.ultrafast_low_rank: int = kwargs.pop("ultrafast_low_rank", 4)
+        self.ultrafast_delta_tolerance: float = kwargs.pop("ultrafast_delta_tolerance", 1e-3)
+        self.ultrafast_freeze_drift_epsilon: float = kwargs.pop("ultrafast_freeze_drift_epsilon", 1e-4)
+        self.ultrafast_ann_nlist: int = kwargs.pop("ultrafast_ann_nlist", 32)
+        self.ultrafast_ann_nprobe: int = kwargs.pop("ultrafast_ann_nprobe", 4)
+        self.ultrafast_ann_max_iter: int = kwargs.pop("ultrafast_ann_max_iter", 6)
 
         # Parameters that define the output variables of `generate`
         self.num_return_sequences: int = kwargs.pop("num_return_sequences", 1)
@@ -431,6 +443,45 @@ class DreamGenerationMixin:
         block_length: Optional[int] = 32,
         dual_cache: bool = False,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
+        ultrafast_enabled = generation_config.ultrafast_enable
+        batch_size = input_ids.size(0)
+        if ultrafast_enabled and batch_size > 1:
+            logger.warning(
+                "UltraFast decoding currently supports batch size 1; falling back to legacy pipeline."
+            )
+            ultrafast_enabled = False
+        if ultrafast_enabled and not dual_cache:
+            logger.warning("UltraFast decoding requires dual_cache=True; using legacy pipeline instead.")
+            ultrafast_enabled = False
+
+        if ultrafast_enabled:
+            return self._sample_ultrafast(
+                input_ids,
+                attention_mask=attention_mask,
+                generation_config=generation_config,
+                threshold=threshold,
+                block_length=block_length,
+                dual_cache=dual_cache,
+            )
+
+        return self._sample_legacy(
+            input_ids,
+            attention_mask=attention_mask,
+            generation_config=generation_config,
+            threshold=threshold,
+            block_length=block_length,
+            dual_cache=dual_cache,
+        )
+
+    def _sample_legacy(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor],
+        generation_config: DreamGenerationConfig,
+        threshold: Optional[float] = 0.9,
+        block_length: Optional[int] = 32,
+        dual_cache: bool = False,
+    ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         
         output_history = generation_config.output_history
@@ -650,3 +701,225 @@ class DreamGenerationMixin:
             )
         else:
             return x
+
+    def _sample_ultrafast(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor],
+        generation_config: DreamGenerationConfig,
+        threshold: Optional[float] = 0.9,
+        block_length: Optional[int] = 32,
+        dual_cache: bool = False,
+    ) -> Union[DreamModelOutput, torch.LongTensor]:
+        if not dual_cache:
+            logger.warning("UltraFast decoding requires dual_cache=True; reverting to legacy cache reuse.")
+            return self._sample_legacy(
+                input_ids,
+                attention_mask=attention_mask,
+                generation_config=generation_config,
+                threshold=threshold,
+                block_length=block_length,
+                dual_cache=dual_cache,
+            )
+
+        output_history = generation_config.output_history
+        return_dict_in_generate = generation_config.return_dict_in_generate
+        max_length = generation_config.max_length
+        mask_token_id = generation_config.mask_token_id
+        steps = generation_config.steps
+        temperature = generation_config.temperature
+        top_p = generation_config.top_p
+        top_k = generation_config.top_k
+        alg = generation_config.alg
+        alg_temp = generation_config.alg_temp
+
+        histories = [] if (return_dict_in_generate and output_history) else None
+
+        x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
+        gen_length = max_length - input_ids.shape[1]
+
+        tok_idx = None
+        if attention_mask is not None and torch.any(attention_mask == 0.0):
+            attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
+            tok_idx = attention_mask.long().cumsum(-1) - 1
+            tok_idx.masked_fill_(attention_mask == 0, 1)
+            attention_mask = torch.logical_and(
+                attention_mask.unsqueeze(1).unsqueeze(-2),
+                attention_mask.unsqueeze(1).unsqueeze(-1),
+            )
+        else:
+            attention_mask = "full"
+
+        if block_length is None:
+            block_length = gen_length
+
+        assert gen_length % block_length == 0, (
+            f"gen_length ({gen_length}) must be divisible by block_length ({block_length})"
+        )
+        num_blocks = gen_length // block_length
+        assert steps % num_blocks == 0, f"steps ({steps}) must be divisible by num_blocks ({num_blocks})"
+        steps_per_block = steps // num_blocks
+
+        timesteps = torch.linspace(1, generation_config.eps, steps_per_block + 1, device=x.device)
+
+        past_key_values = None
+
+        batch_size = x.size(0)
+        assert batch_size == 1, "UltraFast decoding currently supports batch size 1"
+
+        top_k_keys = generation_config.ultrafast_top_k
+        epsilon = generation_config.ultrafast_epsilon
+        low_rank_rank = generation_config.ultrafast_low_rank
+        delta_tol = generation_config.ultrafast_delta_tolerance
+        drift_eps = generation_config.ultrafast_freeze_drift_epsilon
+
+        for num_block in range(num_blocks):
+            block_start = input_ids.shape[1] + num_block * block_length
+            block_end = block_start + block_length
+
+            # Initial full forward to populate caches and logits for the block
+            model_output = self(
+                x,
+                attention_mask,
+                tok_idx,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = model_output.past_key_values
+            logits = torch.cat([model_output.logits[:, :1], model_output.logits[:, :-1]], dim=1)
+
+            block_logits = logits[:, block_start:block_end, :]
+            probs = torch.softmax(block_logits, dim=-1)
+            top_probs, top_indices = probs.topk(2, dim=-1)
+            top_logits = block_logits.gather(-1, top_indices)
+
+            block_confidence = (top_probs[..., 0] - top_probs[..., 1]).squeeze(0)
+            block_predictions = top_indices[:, :, 0].squeeze(0)
+            block_top1_logits = top_logits[:, :, 0].squeeze(0)
+            block_top2_logits = top_logits[:, :, 1].squeeze(0)
+
+            freeze_controller = FreezeWindowController(batch_size, block_length, x.device)
+            ultrafast_ctx = UltraFastContext(
+                top_k=top_k_keys,
+                epsilon=epsilon,
+                delta_updater=DeltaKVLowRank(rank=low_rank_rank, tolerance=delta_tol),
+                freeze_controller=freeze_controller,
+                ann_nlist=generation_config.ultrafast_ann_nlist,
+                ann_nprobe=generation_config.ultrafast_ann_nprobe,
+                ann_max_iter=generation_config.ultrafast_ann_max_iter,
+            )
+            ultrafast_ctx.reset_block()
+
+            step = 0
+
+            while step < steps_per_block:
+                mask_block = (x[:, block_start:block_end] == mask_token_id).squeeze(0)
+                if not mask_block.any():
+                    break
+
+                active_mask = ultrafast_ctx.freeze_controller.active_mask(step).squeeze(0)
+                eligible_indices = torch.nonzero(mask_block & active_mask, as_tuple=False).squeeze(-1)
+                if eligible_indices.numel() == 0:
+                    step += 1
+                    continue
+
+                max_active = min(eligible_indices.numel(), top_k_keys)
+                if max_active <= 0:
+                    max_active = 1
+
+                candidate_conf = block_confidence[eligible_indices]
+                sorted_conf, order = torch.sort(candidate_conf, descending=True)
+                chosen = eligible_indices[order[:max_active]]
+                active_positions = torch.sort(chosen).values
+
+                global_positions = (block_start + active_positions).to(x.device)
+                replace_mask = torch.zeros_like(x, dtype=torch.bool)
+                replace_mask[:, global_positions] = True
+
+                partial_ids = x[:, global_positions]
+
+                ultrafast_ctx.set_active_positions(global_positions.long())
+                model_output = self(
+                    partial_ids,
+                    "full",
+                    None,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    dual_cache=True,
+                    replace_position=replace_mask,
+                    num_logits_to_keep=active_positions.numel(),
+                    ultrafast_context=ultrafast_ctx,
+                )
+                ultrafast_ctx.clear_active_positions()
+
+                past_key_values = model_output.past_key_values
+                partial_logits = model_output.logits
+
+                confidence_step, predicted_tokens = sample_tokens(
+                    partial_logits.squeeze(0),
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    margin_confidence=True,
+                )
+
+                probs_step = torch.softmax(partial_logits.squeeze(0), dim=-1)
+                top_probs_step, top_indices_step = probs_step.topk(2, dim=-1)
+                top_logits_step = partial_logits.squeeze(0).gather(-1, top_indices_step)
+                top1_logits_step = top_logits_step[:, 0]
+                top2_logits_step = top_logits_step[:, 1]
+
+                block_confidence[active_positions] = confidence_step
+                block_predictions[active_positions] = predicted_tokens
+                prev_top1 = block_top1_logits[active_positions].clone()
+                block_top1_logits[active_positions] = top1_logits_step
+                block_top2_logits[active_positions] = top2_logits_step
+
+                drift = torch.abs(block_top1_logits[active_positions] - prev_top1) + drift_eps
+                margins = block_top1_logits[active_positions] - block_top2_logits[active_positions]
+                ultrafast_ctx.freeze_controller.update(
+                    margins.unsqueeze(0),
+                    drift.unsqueeze(0),
+                    active_positions.unsqueeze(0),
+                    step,
+                )
+
+                if alg == 'confidence_threshold':
+                    selected_mask = confidence_step >= threshold
+                    if selected_mask.sum() == 0:
+                        selected_mask[torch.argmax(confidence_step)] = True
+                else:
+                    if step == steps_per_block - 1:
+                        selected_mask = torch.ones_like(confidence_step, dtype=torch.bool)
+                    else:
+                        t = timesteps[step]
+                        s = timesteps[step + 1]
+                        num_mask_token = mask_block.sum().item()
+                        transfer_tokens = int(num_mask_token * (1 - s / t)) if step < steps_per_block - 1 else num_mask_token
+                        transfer_tokens = max(transfer_tokens, 1)
+                        transfer_tokens = min(transfer_tokens, confidence_step.size(0))
+                        if alg_temp is not None and alg_temp > 0:
+                            weights = F.softmax(confidence_step / max(alg_temp, 1e-6), dim=-1)
+                            chosen_idx = torch.multinomial(weights, num_samples=transfer_tokens)
+                        else:
+                            _, chosen_idx = torch.topk(confidence_step, k=transfer_tokens)
+                        selected_mask = torch.zeros_like(confidence_step, dtype=torch.bool)
+                        selected_mask[chosen_idx] = True
+
+                final_positions = active_positions[selected_mask]
+                if final_positions.numel() > 0:
+                    final_tokens = block_predictions[final_positions]
+                    x[:, block_start:block_end][0, final_positions] = final_tokens
+                    block_confidence[final_positions] = torch.inf
+
+                step += 1
+
+            if histories is not None:
+                histories.append(x.clone())
+
+        if return_dict_in_generate:
+            return DreamModelOutput(
+                sequences=x,
+                history=tuple(histories) if histories is not None else None,
+            )
+        return x

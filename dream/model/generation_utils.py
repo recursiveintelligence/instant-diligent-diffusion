@@ -127,6 +127,17 @@ class DreamGenerationConfig(GenerationConfig):
         self.idd_slope_epsilon: float = kwargs.pop("idd_slope_epsilon", 1e-4)
         self.idd_max_conflict_tokens: int = kwargs.pop("idd_max_conflict_tokens", 4)
 
+        # UltraFast-dLLM knobs
+        self.ultrafast_enable: bool = kwargs.pop("ultrafast_enable", True)
+        self.ultrafast_top_k: int = kwargs.pop("ultrafast_top_k", 64)
+        self.ultrafast_epsilon: float = kwargs.pop("ultrafast_epsilon", 1e-3)
+        self.ultrafast_low_rank: int = kwargs.pop("ultrafast_low_rank", 4)
+        self.ultrafast_delta_tolerance: float = kwargs.pop("ultrafast_delta_tolerance", 1e-3)
+        self.ultrafast_freeze_drift_epsilon: float = kwargs.pop("ultrafast_freeze_drift_epsilon", 1e-4)
+        self.ultrafast_ann_nlist: int = kwargs.pop("ultrafast_ann_nlist", 32)
+        self.ultrafast_ann_nprobe: int = kwargs.pop("ultrafast_ann_nprobe", 4)
+        self.ultrafast_ann_max_iter: int = kwargs.pop("ultrafast_ann_max_iter", 6)
+
         # Parameters that define the output variables of `generate`
         self.num_return_sequences: int = kwargs.pop("num_return_sequences", 1)
         self.return_dict_in_generate: bool = kwargs.pop("return_dict_in_generate", False)

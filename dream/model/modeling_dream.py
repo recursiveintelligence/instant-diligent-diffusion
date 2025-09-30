@@ -43,6 +43,7 @@ from transformers.utils import (
 from transformers import PretrainedConfig
 from .configuration_dream import DreamConfig
 from .generation_utils import DreamGenerationMixin, DreamGenerationConfig
+from .ultrafast import UltraFastContext
 
 if is_flash_attn_2_available():
     from transformers.modeling_flash_attention_utils import _flash_attention_forward
@@ -377,6 +378,7 @@ class DreamSdpaAttention(DreamAttention):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
         replace_position: Optional[torch.Tensor] = None,
         dual_cache: Optional[bool] = False,
+        ultrafast_state: Optional["UltraFastContext"] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
@@ -453,19 +455,94 @@ class DreamSdpaAttention(DreamAttention):
         # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
         # is_causal = True if causal_mask is None and q_len > 1 else False
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attention_mask if isinstance(attention_mask, torch.Tensor) else None,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=False, # hard coded
-        )
+        expanded_key_states = repeat_kv(key_states, self.num_key_value_groups)
+        expanded_value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        logits_scale = 1.0 / math.sqrt(self.head_dim)
+
+        attn_output: torch.Tensor
+        attn_weights: Optional[torch.Tensor] = None
+
+        if ultrafast_state is not None:
+            if ultrafast_state.current_positions is None:
+                raise RuntimeError("UltraFastContext requires active positions for sparse attention")
+            active_positions = ultrafast_state.current_positions.to(query_states.device)
+            filter_obj = ultrafast_state.get_filter(self.layer_idx)
+            filter_out = filter_obj.filter(
+                query_states,
+                expanded_key_states,
+                expanded_value_states,
+                ultrafast_state.top_k,
+                changed_positions=ultrafast_state.current_positions.to(query_states.device),
+            )
+
+            key_subset = filter_out.key_subset
+            value_subset = filter_out.value_subset
+
+            lr_attempt = ultrafast_state.delta_updater.try_update(
+                self.layer_idx,
+                active_positions,
+                query_states,
+                key_subset,
+                value_subset,
+                filter_out.indices,
+                logits_scale,
+            )
+
+            if lr_attempt is None:
+                logits = torch.einsum("bhqd,bhqkd->bhqk", query_states, key_subset) * logits_scale
+                if isinstance(attention_mask, torch.Tensor):
+                    attn_bias = torch.gather(
+                        attention_mask,
+                        dim=-1,
+                        index=filter_out.indices.unsqueeze(1).expand(-1, attention_mask.size(1), -1, -1, -1),
+                    )
+                    logits = logits + attn_bias.squeeze(1)
+                attn_probs = torch.softmax(logits, dim=-1)
+                if self.training and self.attention_dropout > 0:
+                    attn_probs = torch.nn.functional.dropout(attn_probs, p=self.attention_dropout, training=True)
+                context = torch.einsum("bhqk,bhqkd->bhqd", attn_probs, value_subset)
+                ultrafast_state.delta_updater.store(
+                    self.layer_idx,
+                    active_positions,
+                    query_states,
+                    key_subset,
+                    value_subset,
+                    filter_out.indices,
+                    logits,
+                    attn_probs,
+                )
+            else:
+                context, logits, attn_probs = lr_attempt
+                ultrafast_state.delta_updater.store(
+                    self.layer_idx,
+                    active_positions,
+                    query_states,
+                    key_subset,
+                    value_subset,
+                    filter_out.indices,
+                    logits,
+                    attn_probs,
+                )
+
+            attn_output = context
+        else:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                expanded_key_states,
+                expanded_value_states,
+                attn_mask=attention_mask if isinstance(attention_mask, torch.Tensor) else None,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=False,
+            )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
 
         attn_output = self.o_proj(attn_output)
+
+        if ultrafast_state is not None:
+            return attn_output, attn_weights, past_key_value
 
         return attn_output, None, past_key_value
 
@@ -540,6 +617,7 @@ class DreamDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             dual_cache=dual_cache,
             replace_position=replace_position,
+            ultrafast_state=kwargs.get("ultrafast_state"),
         )
         hidden_states = residual + hidden_states
 
@@ -680,6 +758,7 @@ class DreamBaseModel(DreamPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         dual_cache: Optional[bool] = False,
         replace_position: Optional[torch.Tensor] = None,
+        ultrafast_context: Optional[UltraFastContext] = None,
     ) -> Union[Tuple, BaseModelOutput]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -731,6 +810,8 @@ class DreamBaseModel(DreamPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
+        ultrafast_kwargs = {"ultrafast_state": ultrafast_context} if ultrafast_context is not None else {}
+
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -738,8 +819,11 @@ class DreamBaseModel(DreamPreTrainedModel):
             layer_past_key_value = past_key_values[layer_idx] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
+                def layer_forward(*inputs):
+                    return decoder_layer(*inputs, **ultrafast_kwargs)
+
                 layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
+                    layer_forward,
                     hidden_states,
                     attention_mask,
                     position_ids,
@@ -763,6 +847,7 @@ class DreamBaseModel(DreamPreTrainedModel):
                     position_embeddings=position_embeddings,
                     dual_cache=dual_cache,
                     replace_position=replace_position,
+                    **ultrafast_kwargs,
                 )
 
             hidden_states = layer_outputs[0]
@@ -839,6 +924,7 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
         num_logits_to_keep: int = 0,
         dual_cache: Optional[bool] = False,
         replace_position: Optional[torch.Tensor] = None,
+        ultrafast_context: Optional[UltraFastContext] = None,
         **loss_kwargs,
     ) -> Union[Tuple, MaskedLMOutput]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -861,6 +947,7 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
             cache_position=cache_position,
             dual_cache=dual_cache,
             replace_position=replace_position,
+            ultrafast_context=ultrafast_context,
         )
         hidden_states = outputs[0]
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss

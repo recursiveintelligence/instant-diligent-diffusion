@@ -72,6 +72,31 @@ https://github.com/user-attachments/assets/32bbff97-6e60-4e14-95c0-2cbec136476f
 4. **Instant Diligent Diffusion (IDD)**
    IDD layers a depth-first denoise-and-backtrack controller on top of Fast-dLLM. It integrates monotone margin integrals as internal path certificates, performs stability-of-recovery perturbation tests to guard against confident-but-wrong tokens, and keeps Fast-dLLM's confidence-aware parallel decoding and blockwise acceleration within an inference-only, training-free pipeline.
 
+### UltraFast-dLLM (New)
+
+UltraFast-dLLM stacks four training-free accelerations on top of Fast-dLLM:
+
+- **Partial-Query Forward (PQF):** evaluate only the tokens selected for update and patch their cached KV entries via DualCache.
+- **Top-K Key Filtering (TKF):** per-layer IVF-style key indices (with dense fallback) keep only top-K keys per query while certifying the dropped softmax tail mass.
+- **Delta-KV Low-Rank updates:** reuse the previous step's logits and contexts via rank-r corrections with Lipschitz error checks; large deltas trigger an automatic exact recompute.
+- **Multi-Rate Early Exit (MREE):** margin-plus-drift certificates freeze stable tokens for multiple reverse steps so they skip compute entirely.
+
+New `DreamGenerationConfig` knobs control UltraFast-dLLM:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ultrafast_enable` | `True` | Enables UltraFast decoding (falls back to the legacy loop when unsupported). |
+| `ultrafast_top_k` | `64` | Base top-K budget per head for TKF; the filter widens automatically until the certified tail mass drops below `ultrafast_epsilon`. |
+| `ultrafast_epsilon` | `1e-3` | Target upper bound on the probability mass discarded by TKF. |
+| `ultrafast_low_rank` | `4` | Rank used for Delta-KV low-rank corrections. |
+| `ultrafast_delta_tolerance` | `1e-3` | Soft bound on the attention update error; exceeding it triggers a full recompute. |
+| `ultrafast_freeze_drift_epsilon` | `1e-4` | Numerical floor for per-token drift estimates when computing freeze windows. |
+| `ultrafast_ann_nlist` | `32` | Number of coarse clusters per layer used by the IVF key index. |
+| `ultrafast_ann_nprobe` | `4` | Number of IVF clusters probed per query before refinement. |
+| `ultrafast_ann_max_iter` | `6` | Lloyd iterations when rebuilding the per-layer IVF centroids. |
+
+Set `ultrafast_enable=False` to recover the previous Fast-dLLM decoding path.
+
 ## Installation
 
 1. Clone the repository:
