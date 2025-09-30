@@ -18,12 +18,13 @@
 import warnings
 import copy
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributions as dists
 from torch.nn import functional as F
 from transformers import __version__
+from .idd import IDDController
 from transformers.generation.configuration_utils import (
     GenerationConfig
 )
@@ -131,6 +132,19 @@ class DreamGenerationConfig(GenerationConfig):
         self.alg: str = kwargs.pop("alg", 'origin')
         self.alg_temp: Optional[float] = kwargs.pop("alg_temp", None)
 
+        # Instant Diligent Diffusion (IDD) knobs
+        self.idd_segments: int = kwargs.pop("idd_segments", 3)
+        self.idd_branch_budget: int = kwargs.pop("idd_branch_budget", 2)
+        self.idd_max_nodes: int = kwargs.pop("idd_max_nodes", 64)
+        self.idd_topk: int = kwargs.pop("idd_topk", 3)
+        self.idd_sor_steps: int = kwargs.pop("idd_sor_steps", 3)
+        self.idd_sor_threshold: float = kwargs.pop("idd_sor_threshold", 0.7)
+        self.idd_sor_max_tokens: int = kwargs.pop("idd_sor_max_tokens", 4)
+        self.idd_lambda_sor: float = kwargs.pop("idd_lambda_sor", 0.5)
+        self.idd_mmi_threshold: float = kwargs.pop("idd_mmi_threshold", 0.1)
+        self.idd_slope_epsilon: float = kwargs.pop("idd_slope_epsilon", 1e-4)
+        self.idd_max_conflict_tokens: int = kwargs.pop("idd_max_conflict_tokens", 4)
+
         # Parameters that define the output variables of `generate`
         self.num_return_sequences: int = kwargs.pop("num_return_sequences", 1)
         self.return_dict_in_generate: bool = kwargs.pop("return_dict_in_generate", False)
@@ -185,6 +199,30 @@ class DreamGenerationMixin:
         if attention_mask is not None:
             attention_mask = attention_mask.repeat_interleave(expand_size, dim=0)
         return input_ids, attention_mask
+
+    @staticmethod
+    def _build_idd_segments(total_steps: int, desired_segments: int) -> List[Tuple[int, int]]:
+        if total_steps <= 0:
+            return [(0, 0)]
+
+        desired_segments = max(1, desired_segments)
+        base = total_steps // desired_segments
+        remainder = total_steps % desired_segments
+
+        segments: List[Tuple[int, int]] = []
+        start = 0
+        for idx in range(desired_segments):
+            length = base + (1 if idx < remainder else 0)
+            end = min(total_steps, start + max(1, length))
+            if start >= end:
+                continue
+            segments.append((start, end))
+            start = end
+
+        if segments[-1][1] < total_steps:
+            segments[-1] = (segments[-1][0], total_steps)
+
+        return segments
 
     def _validate_generated_length(self, generation_config, input_ids_length, has_default_max_length):
         """Performs validation related to the resulting generated length"""
@@ -412,6 +450,64 @@ class DreamGenerationMixin:
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
         gen_length = max_length - input_ids.shape[1]
         
+        tok_idx = None
+        if attention_mask is not None and torch.any(attention_mask == 0.0):
+            attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
+            tok_idx = attention_mask.long().cumsum(-1) - 1
+            tok_idx.masked_fill_(attention_mask == 0, 1)
+            attention_mask = torch.logical_and(
+                attention_mask.unsqueeze(1).unsqueeze(-2),
+                attention_mask.unsqueeze(1).unsqueeze(-1),
+            )
+        else:
+            attention_mask = "full"
+
+        timesteps_total = torch.linspace(1, generation_config.eps, steps + 1, device=x.device)
+
+        if alg == 'idd':
+            assert x.shape[0] == 1, "IDD currently supports batch size of 1"
+            segment_boundaries = self._build_idd_segments(steps, generation_config.idd_segments)
+
+            def _noop_tokens(step_idx, tensor, logits):
+                return tensor
+
+            def _noop_logits(step_idx, tensor, logits):
+                return logits
+
+            controller = IDDController(
+                model=self,
+                x_init=x.clone(),
+                attention_mask=attention_mask if isinstance(attention_mask, torch.Tensor) else None,
+                tok_idx=tok_idx if isinstance(tok_idx, torch.Tensor) else None,
+                timesteps=timesteps_total,
+                num_steps=steps,
+                segment_boundaries=segment_boundaries,
+                mask_token_id=mask_token_id,
+                threshold=threshold,
+                branch_top_k=generation_config.idd_topk,
+                branch_budget=generation_config.idd_branch_budget,
+                max_nodes=generation_config.idd_max_nodes,
+                sor_steps=generation_config.idd_sor_steps,
+                sor_threshold=generation_config.idd_sor_threshold,
+                sor_max_tokens=generation_config.idd_sor_max_tokens,
+                lambda_sor=generation_config.idd_lambda_sor,
+                mmi_threshold=generation_config.idd_mmi_threshold,
+                slope_epsilon=generation_config.idd_slope_epsilon,
+                tokens_hook=_noop_tokens,
+                logits_hook=_noop_logits,
+                max_conflict_tokens=generation_config.idd_max_conflict_tokens,
+            )
+            best_seq, _, history_records = controller.run()
+            if return_dict_in_generate:
+                history_output = None
+                if output_history:
+                    history_output = tuple(rec.x_after.clone() for rec in history_records if rec.x_after is not None)
+                return DreamModelOutput(
+                    sequences=best_seq,
+                    history=history_output,
+                )
+            return best_seq
+
         # Handle block configuration
         if block_length is None:
             block_length = gen_length  # Default: single block (original behavior)
@@ -422,21 +518,6 @@ class DreamGenerationMixin:
         assert steps % num_blocks == 0, f"steps ({steps}) must be divisible by num_blocks ({num_blocks})"
         steps_per_block = steps // num_blocks
         timesteps = torch.linspace(1, generation_config.eps, steps_per_block + 1, device=x.device)
-
-        if attention_mask is not None and torch.any(attention_mask == 0.0):
-            # we do not mask the [MASK] tokens so value = 1.0
-            attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
-            tok_idx = attention_mask.long().cumsum(-1) - 1
-            tok_idx.masked_fill_(attention_mask == 0, 1)
-            # attention_mask is of shape [B, N]
-            # broadcast to [B, 1, N, N]
-            attention_mask = torch.logical_and(
-                attention_mask.unsqueeze(1).unsqueeze(-2),
-                attention_mask.unsqueeze(1).unsqueeze(-1),
-            )
-        else:
-            tok_idx = None
-            attention_mask = "full"
 
         # Initialize cache for the prompt
         past_key_values = None

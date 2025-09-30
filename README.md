@@ -3,7 +3,7 @@
 [![arXiv](https://img.shields.io/badge/Paper-arXiv-red.svg)](https://arxiv.org/abs/2505.22618)
 <a href="https://fast-dllm.hanlab.ai"><img src="https://img.shields.io/static/v1?label=Demo&message=Fast-dLLM&color=yellow"></a> &ensp;
 
-Fast-DLLM is a diffusion-based Large Language Model (LLM) inference acceleration framework that supports efficient inference for models like Dream and LLaDA.
+Fast-DLLM is a diffusion-based Large Language Model (LLM) inference acceleration framework that supports efficient inference for models like Dream and LLaDA. The repository now also includes **Instant Diligent Diffusion (IDD)**, a training-free, inference-only controller that adds depth-first reasoning with learned backtracking on top of Fast-dLLM's confidence-aware parallel decoding.
 
 ## Demo
 
@@ -66,8 +66,11 @@ https://github.com/user-attachments/assets/32bbff97-6e60-4e14-95c0-2cbec136476f
 
 <div align="center">
   <img src="asset/overall_performance.jpg" alt="Overall performance" width="800"/>
-  <p>Overall performance comparison</p>
+ <p>Overall performance comparison</p>
 </div>
+
+4. **Instant Diligent Diffusion (IDD)**
+   IDD layers a depth-first denoise-and-backtrack controller on top of Fast-dLLM. It integrates monotone margin integrals as internal path certificates, performs stability-of-recovery perturbation tests to guard against confident-but-wrong tokens, and keeps Fast-dLLM's confidence-aware parallel decoding and blockwise acceleration within an inference-only, training-free pipeline.
 
 ## Installation
 

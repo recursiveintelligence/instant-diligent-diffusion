@@ -20,12 +20,13 @@ import time
 import warnings
 import copy
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributions as dists
 from torch.nn import functional as F
 from transformers import __version__
+from .idd import IDDController
 from transformers.generation.configuration_utils import (
     GenerationConfig
 )
@@ -113,6 +114,19 @@ class DreamGenerationConfig(GenerationConfig):
         self.alg: str = kwargs.pop("alg", 'origin')
         self.alg_temp: Optional[float] = kwargs.pop("alg_temp", None)
 
+        # Instant Diligent Diffusion (IDD) specific knobs
+        self.idd_segments: int = kwargs.pop("idd_segments", 3)
+        self.idd_branch_budget: int = kwargs.pop("idd_branch_budget", 2)
+        self.idd_max_nodes: int = kwargs.pop("idd_max_nodes", 64)
+        self.idd_topk: int = kwargs.pop("idd_topk", 3)
+        self.idd_sor_steps: int = kwargs.pop("idd_sor_steps", 3)
+        self.idd_sor_threshold: float = kwargs.pop("idd_sor_threshold", 0.7)
+        self.idd_sor_max_tokens: int = kwargs.pop("idd_sor_max_tokens", 4)
+        self.idd_lambda_sor: float = kwargs.pop("idd_lambda_sor", 0.5)
+        self.idd_mmi_threshold: float = kwargs.pop("idd_mmi_threshold", 0.1)
+        self.idd_slope_epsilon: float = kwargs.pop("idd_slope_epsilon", 1e-4)
+        self.idd_max_conflict_tokens: int = kwargs.pop("idd_max_conflict_tokens", 4)
+
         # Parameters that define the output variables of `generate`
         self.num_return_sequences: int = kwargs.pop("num_return_sequences", 1)
         self.return_dict_in_generate: bool = kwargs.pop("return_dict_in_generate", False)
@@ -167,6 +181,31 @@ class DreamGenerationMixin:
         if attention_mask is not None:
             attention_mask = attention_mask.repeat_interleave(expand_size, dim=0)
         return input_ids, attention_mask
+
+    @staticmethod
+    def _build_idd_segments(total_steps: int, desired_segments: int) -> List[Tuple[int, int]]:
+        """Constructs contiguous step intervals used as segments for IDD."""
+        if total_steps <= 0:
+            return [(0, 0)]
+
+        desired_segments = max(1, desired_segments)
+        base = total_steps // desired_segments
+        remainder = total_steps % desired_segments
+
+        segments: List[Tuple[int, int]] = []
+        start = 0
+        for idx in range(desired_segments):
+            length = base + (1 if idx < remainder else 0)
+            end = min(total_steps, start + max(1, length))
+            if start >= end:
+                continue
+            segments.append((start, end))
+            start = end
+
+        if segments[-1][1] < total_steps:
+            segments[-1] = (segments[-1][0], total_steps)
+
+        return segments
 
     def _validate_generated_length(self, generation_config, input_ids_length, has_default_max_length):
         """Performs validation related to the resulting generated length"""
@@ -409,6 +448,43 @@ class DreamGenerationMixin:
             attention_mask = "full"
 
         timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
+
+        if alg == 'idd':
+            assert x.shape[0] == 1, "IDD currently supports batch size of 1"
+            segment_boundaries = self._build_idd_segments(steps, generation_config.idd_segments)
+            controller = IDDController(
+                model=self,
+                x_init=x.clone(),
+                attention_mask=attention_mask,
+                tok_idx=tok_idx,
+                timesteps=timesteps,
+                num_steps=steps,
+                segment_boundaries=segment_boundaries,
+                mask_token_id=mask_token_id,
+                threshold=threshold,
+                branch_top_k=generation_config.idd_topk,
+                branch_budget=generation_config.idd_branch_budget,
+                max_nodes=generation_config.idd_max_nodes,
+                sor_steps=generation_config.idd_sor_steps,
+                sor_threshold=generation_config.idd_sor_threshold,
+                sor_max_tokens=generation_config.idd_sor_max_tokens,
+                lambda_sor=generation_config.idd_lambda_sor,
+                mmi_threshold=generation_config.idd_mmi_threshold,
+                slope_epsilon=generation_config.idd_slope_epsilon,
+                tokens_hook=generation_tokens_hook_func,
+                logits_hook=generation_logits_hook_func,
+                max_conflict_tokens=generation_config.idd_max_conflict_tokens,
+            )
+            best_seq, _, controller_history = controller.run()
+            if return_dict_in_generate:
+                history_output = None
+                if output_history:
+                    history_output = tuple(rec.x_after.clone() for rec in controller_history if rec.x_after is not None)
+                return DreamModelOutput(
+                    sequences=best_seq,
+                    history=history_output,
+                )
+            return best_seq
 
         # this allows user-defined token control of the intermediate steps
         x = generation_tokens_hook_func(None, x, None)
